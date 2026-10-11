@@ -1,0 +1,1237 @@
+//  ServerComposition
+//  Building the server, once, in one place.
+//
+//  Everything above this file takes what it needs as a parameter. This is the only code that
+//  knows the whole graph, and it is deliberately readable top to bottom: what starts before
+//  what is answered by reading this file, not by tracing.
+//
+//  Three properties this is responsible for:
+//
+//    1. **The server starts even when things are wrong.** No Full Disk Access, no Firebase,
+//       no helper: it still comes up, so the user can reach the UI and fix it. A server that
+//       refuses to boot cannot tell anyone why it refused.
+//    2. **Optional subsystems stay absent when unconfigured.** Push with no credentials and
+//       token auth under the default mode are not disabled features holding resources; they
+//       are never constructed, and their routes are never registered.
+//    3. **Start order is derived, stop order is its exact reverse.** Both come from the
+//       declared dependency graph rather than from two hand-maintained lists.
+//
+//  See `.claude/docs/architecture.md`.
+
+import BBAppStore
+import BBAudit
+import BBAuth
+import BBBuiltIns
+import BBContacts
+import BBCore
+import BBDiagnostics
+import BBEvents
+import BBHTTPAPI
+import BBHandlers
+import BBIMessage
+import BBInterfaces
+import BBLicense
+import BBLicensing
+import BBPersistence
+import BBPrivateAPI
+import BBProxy
+import BBPushKit
+import BBSerialization
+import BBServiceKit
+import BBSettings
+import BBSocketIO
+import BBSystem
+import BBTooling
+import Foundation
+import GRDB
+import Logging
+
+public struct ServerComposition {
+
+  public struct Options: Sendable {
+    public var headless: Bool
+    public var configPath: String?
+    /// Overrides from the command line, which win over both the config file and the
+    /// stored value.
+    public var overrides: [String: String]
+    /// Applies to both the file log and stdout.
+    public var logLevel: Logger.Level
+
+    public init(
+      headless: Bool = false,
+      configPath: String? = nil,
+      overrides: [String: String] = [:],
+      logLevel: Logger.Level = .info
+    ) {
+      self.headless = headless
+      self.configPath = configPath
+      self.overrides = overrides
+      self.logLevel = logLevel
+    }
+  }
+
+  /// The long-lived storage every other object is built from.
+  ///
+  /// Split out of `build` so it can be opened WITHOUT building a server. Two callers need
+  /// that: `bluebubbles-server --migrate`, which runs a migration and exits, and the app,
+  /// which has to know whether a migration is pending before it decides to start anything.
+  ///
+  /// Opening it twice is not an option, which is why this is a value passed in rather than
+  /// a second `AppDatabase.open`. The reason is the CACHE, not the lock: `SettingsStore`
+  /// keeps the whole table in memory, so two
+  /// stores would silently disagree after either one wrote.
+  ///
+  /// This paragraph used to say `AppDatabase.open` leaves GRDB's `.immediateError` busy mode
+  /// in place, so a second connection throws `SQLITE_BUSY` on the first contended write. It
+  /// does not: `AppDatabase.open` sets `busyMode = .timeout(5)`. The rule above is still the
+  /// rule, and the cache is the reason it is; the lock argument was decoration that happened
+  /// to be false.
+  public struct Storage: Sendable {
+    public let logSink: FileSink
+    public let logger: Logger
+    public let appDatabase: AppDatabase
+    /// The Keychain in production; a test passes what it likes.
+    public let secrets: any SecretStore
+    public let settings: SettingsStore
+  }
+
+  /// Opens storage and nothing else. Safe to call before deciding whether to start.
+  ///
+  /// `LoggingSystemBootstrap.bootstrap` is idempotent, so this sitting in front of a later
+  /// `build(storage:options:)` costs nothing.
+  public static func prepareStorage(options: Options = Options()) async throws -> Storage {
+    // Bootstrapped before anything else logs, and to the SAME path the Electron server
+    // uses: an operator debugging a migrated install should find one log file where
+    // they expect it, not two. Held so `GET /server/logs` can tail it: without the sink,
+    // that route has nothing to read and a client's log viewer goes blank.
+    let logSink = LoggingSystemBootstrap.bootstrap(level: options.logLevel)
+    let logger = Logger(label: "bluebubbles")
+
+    // Before the first file in it is opened. `AppDatabase.open` creates the directory with
+    // no attributes, which is how it came to be 0755 on every install — holding the push
+    // tokens, the blocklist and the Firebase credentials.
+    try ApplicationSupport.prepareOwnDirectory()
+
+    let appDatabase = try AppDatabase.open(contributors: AppSchema.contributors)
+    // Service name from `ApplicationSupport`, NOT the default, so a run redirected by
+    // `BB_SUPPORT_DIRECTORY` cannot reach the real installation's credentials. See the
+    // comment on `keychainService`.
+    let secrets = KeychainSecretStore(service: ApplicationSupport.keychainService)
+    let settings = try await SettingsStore(
+      database: appDatabase,
+      secrets: secrets,
+      configFileValues: ConfigFile.load(at: options.configPath),
+      commandLineValues: options.overrides
+    )
+
+    // Raised to whatever the user asked for, as soon as the store can answer.
+    //
+    // After the store rather than at bootstrap, because the level LIVES in the store: the
+    // handful of lines logged before this point are start-up chatter at the default level.
+    // Without this the setting is read by nothing, so turning on debug logging does nothing
+    // and gives no hint why.
+    LoggingSystemBootstrap.setLevel(
+      Settings.logLevel(from: await settings.get(Settings.logLevel))
+    )
+
+    return Storage(
+      logSink: logSink, logger: logger, appDatabase: appDatabase,
+      secrets: secrets, settings: settings
+    )
+  }
+
+  /// Builds every long-lived object and returns the assembled server.
+  ///
+  /// Opens its own storage. Callers that already have some (because they had to inspect it
+  /// first) pass it to `build(storage:options:)` instead.
+  public static func build(options: Options = Options()) async throws -> RunningServer {
+    try await build(storage: try await prepareStorage(options: options), options: options)
+  }
+
+  /// Builds from storage somebody else opened.
+  ///
+  /// The steps, in the order they happen: refuse an install nobody has adopted, move each
+  /// service's settings into the shape it expects, open the read path, build the services
+  /// that everything else leans on, build the transport, assemble the context, register
+  /// the services, and hand back the assembled server.
+  ///
+  /// Each step is a function below this one, in call order, so the file still reads top to
+  /// bottom, and each is short enough to hold in one's head, which the 345-line version of
+  /// this function had stopped being.
+  public static func build(
+    storage: Storage, options: Options = Options()
+  ) async throws -> RunningServer {
+    // Everything assembly writes (seeded defaults, adopted certificates, migrated service
+    // settings) is the SERVER's doing, and the audit log attributes it so. See `AuditContext`.
+    try await AuditContext.acting(as: .system(component: "startup")) {
+      try await assemble(storage: storage, options: options)
+    }
+  }
+
+  private static func assemble(
+    storage: Storage, options: Options
+  ) async throws -> RunningServer {
+    let logger = storage.logger
+    let settings = storage.settings
+
+    try await refuseUnadoptedInstall(settings: settings)
+    // The validator's verdict, carried to registration. A service the validator REFUSED is
+    // not registered, so it cannot start; previously the verdict reached `prepare` and
+    // nothing else, and a fatally invalid manifest ran anyway.
+    let refusedServices = await prepareServiceSettings(settings: settings, logger: logger)
+
+    // Built here rather than inside the read path or the service, because BOTH need it and
+    // they need the same one.
+    let searchIndex = SearchIndexStore(logger: logger)
+    let readPath = await openReadPath(
+      settings: settings, logger: logger, searchIndex: searchIndex)
+    let shared = await makeSharedServices(storage: storage)
+    let transport = await makeTransport(
+      storage: storage, accessControl: shared.accessControl, auditLog: shared.auditLog)
+
+    // Decided before the context is built, because the HTTP service mounts them and is
+    // constructed by the registry with nothing but a context to read from.
+    let additionalGroups = await routeGroups(
+      authMode: transport.authMode,
+      codecs: transport.codecs,
+      features: Set(
+        await settings.featureStates().filter(\.value).keys.map(\.id)
+      ),
+      faceTime: await settings.get(Settings.enableFaceTimePrivateAPI),
+      faceTimeIncoming: await settings.get(Settings.faceTimeIncomingHandoff)
+    )
+
+    let context = AppContext(
+      storage: storage,
+      readPath: readPath,
+      shared: shared,
+      transport: transport,
+      additionalRouteGroups: additionalGroups,
+      // Registered with every manifest below, so a tool is known to the manager because
+      // a service declared it, not because this file lists it a second time.
+      tools: ToolManager(
+        alerts: shared.alerts,
+        // The bundled copy stays a fallback rather than being removed: a build that
+        // does ship binaries in `Contents/Resources/bin` keeps working, and an
+        // offline first run has something to fall back to.
+        bundledLocator: { BundledBinaries.path(for: $0) },
+        logger: logger
+      )
+    )
+
+    let registry = await makeRegistry(context: context, shared: shared, settings: settings)
+    await context.finishWiring(
+      registry: registry,
+      handlers: buildHandlers(
+        context: context,
+        authMode: transport.authMode,
+        codecs: transport.codecs,
+        additionalGroups: additionalGroups,
+        logSink: storage.logSink,
+        logger: logger
+      )
+    )
+
+    // Every tool any service declares, in one registry. Derived from the manifests so a
+    // program the server can install is exactly a program some service said it needs,
+    // and so a third-party connection method's binary is managed by the same code that
+    // manages ngrok's, with no list here to add itself to.
+    // Tools come from the manifests that survived validation, for the same reason: a tool
+    // descriptor on a refused manifest is an instruction to download and run a program from
+    // a manifest we have just declared invalid.
+    await context.tools.register(
+      BuiltInManifests.all.filter { !refusedServices.contains($0.id) }
+    )
+
+    // Look for copies already on this Mac BEFORE any service starts, because the answer
+    // decides whether a connection method has a program at all. A scan that landed after
+    // `ProxyService.start` would leave a user who HAS cloudflared looking at "Cloudflare is
+    // selected but not installed", with a working tunnel only after a restart.
+    //
+    // It is cheap enough to wait for: a Mac with none of these installed spawns nothing,
+    // because no candidate file exists to probe, and a Mac that has them re-probes only
+    // when a binary's fingerprint has moved. The bound is here for the case neither of
+    // those covers — a first run where a binary stalls in Gatekeeper assessment — and
+    // carrying on without the answer is correct there: the scan is retried by
+    // `ToolUpdateService`, and nothing here is wrong without it, only slower to notice.
+    do {
+      let tools = context.tools
+      try await withTimeout(.seconds(5)) { await tools.scanForExistingCopies() }
+    } catch {
+      logger.warning(
+        "Looking for programs already installed on this Mac did not finish in time",
+        metadata: ["error": .string(String(describing: error))]
+      )
+    }
+
+    await registerServices(in: registry, refusing: refusedServices)
+
+    return RunningServer(
+      context: context,
+      logSink: storage.logSink,
+      registry: registry,
+      // Constructed here rather than inside `start()` so the whole graph is visible in
+      // one place, and so a test can drive it without standing up a listener.
+      propagation: makePropagation(
+        settings: settings, registry: registry, context: context, shared: shared,
+        passwordDigests: transport.passwordDigests
+      ),
+      handlers: await context.httpHandlers,
+      routeGroups: additionalGroups,
+      options: options,
+      logger: logger
+    )
+  }
+
+  // MARK: - Before anything is built
+
+  /// Refuses to build on an unadopted Electron install. This does NOT migrate.
+  ///
+  /// Migrating automatically would rewrite a user's settings and move their credentials with
+  /// no notice and no way to decline, and redoing a settings import is not harmless: it
+  /// writes every key it finds with no comparison and reverts anything changed since.
+  ///
+  /// Building on defaults instead would be worse still (a different port, no password)
+  /// so the answer is to refuse and say so. `bluebubbles-server --migrate` adopts it; the
+  /// app presents a wizard. Certificates are deliberately NOT in the blocking set: see
+  /// `MigrationStep.isBlocking`.
+  static func refuseUnadoptedInstall(settings: SettingsStore) async throws {
+    let migration = await MigrationStateStore.status(in: settings)
+    if migration.isBlockingStart {
+      throw MigrationPending(steps: migration.blocking.map(\.step))
+    }
+  }
+
+  /// Runs each service's own settings migrations.
+  ///
+  /// In the same window and for the same reason as the install gate above: a service that
+  /// reads its settings before they have been moved configures itself from the old shape
+  /// and never looks again.
+  ///
+  /// Validated BEFORE migrations run, because a migration is described by the same
+  /// manifest: applying one from a manifest that has not been checked would be acting on
+  /// untrusted instructions about where someone's data should go.
+  /// - Returns: the services the validator REFUSED, so registration can skip them.
+  ///
+  ///   Returning them is the point. The validated list used to be passed to `prepare` and
+  ///   nowhere else, while `registerServices` registered every service unconditionally: a
+  ///   FATAL manifest problem (an entitlement naming a secret, a tool with no checksum) was
+  ///   logged and the service ran anyway. A validator whose verdict nothing acts on is a
+  ///   log line, and the same manifests and the same validator are meant to be the boundary
+  ///   for third-party plugins.
+  static func prepareServiceSettings(
+    settings: SettingsStore, logger: Logger
+  ) async -> Set<ServiceIdentifier> {
+    await seedDisabledServices(settings: settings, logger: logger)
+    let validated = await ServiceSettingsBridge.validate(
+      manifests: BuiltInManifests.all,
+      enabled: await enabledServices(settings: settings),
+      logger: logger,
+      // No alert centre yet: it is constructed further down, after storage. A conflict
+      // found here is logged and re-raised once the centre exists rather than being
+      // dropped; see `SettingsPropagation`, which re-validates on a settings change.
+      alerts: nil
+    )
+    await ServiceSettingsBridge.prepare(
+      manifests: validated, store: settings, logger: logger
+    )
+    let kept = Set(validated.map(\.id))
+    let refused = Set(BuiltInManifests.all.map(\.id)).subtracting(kept)
+    return withDependents(of: refused, logger: logger)
+  }
+
+  /// A refusal, closed over everything that depends on it.
+  ///
+  /// **Refusing a leaf is safe; refusing a dependency was not.** A refused service is not
+  /// registered at all, which is the point — the registry cannot start what it does not know
+  /// about. But `resolveStartOrder()` throws `unknownDependency` when a registered service
+  /// names one that is absent, and sixteen built-in manifests declare a dependency on the
+  /// HTTP service. So refusing that one manifest took the whole server down with it: nothing
+  /// started, which is the exact opposite of the first property this file's own header
+  /// claims, that the server starts even when things are wrong.
+  ///
+  /// The existing refusal test only ever refused a leaf, so the case was invisible. It bites
+  /// third-party manifests first, and any future built-in that fails validation.
+  ///
+  /// Transitive, and computed to a fixed point: refusing HTTP refuses the socket, and
+  /// refusing the socket refuses anything that named the socket.
+  static func withDependents(
+    of refused: Set<ServiceIdentifier>, logger: Logger
+  ) -> Set<ServiceIdentifier> {
+    guard !refused.isEmpty else { return refused }
+    var closed = refused
+    var changed = true
+    while changed {
+      changed = false
+      for manifest in BuiltInManifests.all where !closed.contains(manifest.id) {
+        guard manifest.dependencies.contains(where: closed.contains) else { continue }
+        closed.insert(manifest.id)
+        changed = true
+        logger.warning(
+          "Refusing a service because something it depends on was refused",
+          metadata: [
+            "service": .string(manifest.id.rawValue),
+            "dependencies": .string(
+              manifest.dependencies.filter(closed.contains).map(\.rawValue)
+                .sorted().joined(separator: ", ")),
+          ])
+      }
+    }
+    return closed
+  }
+
+  /// Which services count as ON, for the validator's exclusivity rule.
+  ///
+  /// Everything the user has not switched off, MINUS the connection methods that were not
+  /// selected. This used to be the single selected method, which made the "two connection
+  /// methods are enabled" rule unreachable: the rule looks for two enabled members of one
+  /// exclusive category, and a one-element set has no two of anything.
+  ///
+  /// It is still unreachable today, and honestly so: the selection is one setting, so two
+  /// built-in methods cannot both be on. It becomes reachable the day a third-party method
+  /// joins the category, which is the case the validator exists for.
+  /// Writes the default set of switched-off services, once, on an install that has never
+  /// had one; and on an install that has, adds each switched-off-by-default service it has
+  /// never seen.
+  ///
+  /// Guarded on the key being ABSENT rather than empty: an empty `disabled_services` is a
+  /// real answer — somebody switched everything on — and re-seeding over it would turn ntfy
+  /// back off under them. `--set disabled_services=…` counts as present for the same reason,
+  /// so a run started with an override is never seeded on top of.
+  ///
+  /// The second half is what makes "ships switched off" true on an UPGRADE. Without it a
+  /// service added to `disabledByDefault` after an install was seeded is simply not in that
+  /// install's list, and so comes up running on the first start after the upgrade. "Never
+  /// seen" is the service's `__version` stamp being absent, which `ServiceSettingsBridge.prepare`
+  /// writes for every manifest on the first start that knows it, enabled or not, and which
+  /// this runs before. So the amendment happens once per service per install, and a person
+  /// who later switches the service on is never switched back off. It amends the STORED
+  /// list, never an override, so a `--set` run does not persist what it was told.
+  ///
+  /// The evidence that ntfy is already IN USE is its topic, in either place it can live: the
+  /// integration's own field, or the core `ntfy_topic` an install had before ntfy was an
+  /// integration. Seeding a working ntfy off during an upgrade is the one outcome this must
+  /// not have, and it is invisible when it happens — notifications simply stop.
+  static func seedDisabledServices(settings: SettingsStore, logger: Logger) async {
+    let inUse = await servicesAlreadyInUse(settings: settings)
+    guard await settings.string(forKey: Settings.disabledServicesKey) == nil else {
+      await disableServicesNewToThisInstall(settings: settings, inUse: inUse, logger: logger)
+      return
+    }
+
+    let seeded = ServiceEnablement.seed(skipping: inUse)
+    // Written even when EMPTY, because the write is what records that the seed has run: a
+    // skipped write would leave the key absent and seed again on the next start, after the
+    // user had switched something on.
+    do {
+      try await settings.set(
+        ServiceEnablement.serialized(seeded),
+        forKey: Settings.disabledServicesKey,
+        isSecret: false
+      )
+      guard !seeded.isEmpty else { return }
+      logger.info(
+        "Seeded the services that ship switched off",
+        metadata: ["services": .string(seeded.sorted().joined(separator: ", "))])
+    } catch {
+      // Not fatal, and not silent. Everything runs this start, which is the pre-seed
+      // behaviour rather than a broken one, and the next start tries again.
+      logger.error(
+        "Could not seed the default service list",
+        metadata: ["error": .string(DiagnosticText.sentence(for: error))])
+    }
+  }
+
+  /// Adds to the stored list each switched-off-by-default service this install has never
+  /// prepared. See `seedDisabledServices`.
+  private static func disableServicesNewToThisInstall(
+    settings: SettingsStore, inUse: Set<ServiceIdentifier>, logger: Logger
+  ) async {
+    // The stored list only: nothing stored means the key is an override, and an override is
+    // this run's business, not the install's.
+    guard let stored = await settings.persistedString(forKey: Settings.disabledServicesKey)
+    else { return }
+
+    var unseen: Set<ServiceIdentifier> = []
+    for manifest in BuiltInManifests.all
+    where BuiltInManifests.disabledByDefault.contains(manifest.id) {
+      let stamp = await settings.string(forKey: ServiceMigrator.versionKey(for: manifest))
+      if stamp == nil { unseen.insert(manifest.id) }
+    }
+    let disabled = ServiceEnablement.disabledIdentifiers(in: stored)
+    let added = Set(unseen.subtracting(inUse).map(\.rawValue)).subtracting(disabled)
+    guard !added.isEmpty else { return }
+
+    do {
+      try await settings.set(
+        ServiceEnablement.serialized(disabled.union(added)),
+        forKey: Settings.disabledServicesKey,
+        isSecret: false
+      )
+      logger.info(
+        "Switched off services this install had not seen, which ship switched off",
+        metadata: ["services": .string(added.sorted().joined(separator: ", "))])
+    } catch {
+      // The service's version is stamped later in this start whatever happens here, so a
+      // failed write is not retried: say so at the level that gets read.
+      logger.error(
+        "Could not switch off a service that ships switched off; it runs until switched off",
+        metadata: [
+          "services": .string(added.sorted().joined(separator: ", ")),
+          "error": .string(DiagnosticText.sentence(for: error)),
+        ])
+    }
+  }
+
+  /// Services this install is evidently already using, so a default must not switch them
+  /// off. The evidence that ntfy is IN USE is its topic, in either place it can live.
+  private static func servicesAlreadyInUse(settings: SettingsStore) async
+    -> Set<ServiceIdentifier>
+  {
+    var inUse: Set<ServiceIdentifier> = []
+    let ntfy = BuiltInManifests.ntfy
+    let configuredTopic =
+      await settings.string(forKey: ntfy.storageKey(for: NtfySettingsAdoption.Field.topic)) ?? ""
+    let legacyTopic = await settings.string(forKey: Settings.ntfyTopic.key) ?? ""
+    if !configuredTopic.trimmingCharacters(in: .whitespaces).isEmpty
+      || !legacyTopic.trimmingCharacters(in: .whitespaces).isEmpty
+    {
+      inUse.insert(ntfy.id)
+    }
+    return inUse
+  }
+
+  static func enabledServices(settings: SettingsStore) async -> Set<ServiceIdentifier> {
+    let selected = ServiceIdentifier(await settings.get(Settings.connectionMethod))
+    let raw = await settings.string(forKey: Settings.disabledServicesKey) ?? ""
+    // `ServiceEnablement` already owns the parse and the always-on exemptions; a second
+    // reading of the same setting here is how the two would come to disagree.
+    let disabled = ServiceEnablement.disabledIdentifiers(in: raw)
+    var enabled: Set<ServiceIdentifier> = []
+    for manifest in BuiltInManifests.all {
+      if manifest.category == .reverseProxy {
+        if manifest.id == selected { enabled.insert(manifest.id) }
+      } else if ServiceEnablement.isEnabled(manifest.id, disabled: disabled) {
+        enabled.insert(manifest.id)
+      }
+    }
+    return enabled
+  }
+
+  // MARK: - chat.db
+
+  /// Everything the read path needs, or nothing at all.
+  ///
+  /// Optional as a set rather than one field at a time: without Full Disk Access there is
+  /// no database, and with no database there is no profile, no repository and no
+  /// serializer either. Four independent optionals could express states that cannot happen.
+  struct ReadPath: Sendable {
+    var database: ReadOnlyDatabase?
+    var profile: SchemaProfile?
+    var messages: MessageRepository?
+    var serializer: MessageSerializer?
+    /// The search index, shared between the repository that READS it and the service that
+    /// writes it. One instance, because they have to mean the same file: the service opens
+    /// and fills it, the repository consults whatever is open.
+    ///
+    /// NOT optional and not conditional on `chat.db`. The index has to be reachable even
+    /// when the read path failed, because switching the feature off has to be able to delete
+    /// it, and "this Mac has no Full Disk Access" is not a reason to leave a word list on
+    /// disk.
+    var searchIndex: SearchIndexStore = SearchIndexStore()
+  }
+
+  /// Opens `chat.db`, or reports that it could not.
+  ///
+  /// Optional, and that is the point. Without Full Disk Access there is no database to
+  /// open, and the server must still start, or the user cannot reach the permissions
+  /// page that would fix it.
+  static func openReadPath(
+    settings: SettingsStore, logger: Logger, searchIndex: SearchIndexStore
+  ) async -> ReadPath {
+    do {
+      // Read before the open, because it decides which KIND of connection to make. One is
+      // the default and the shape this has always had; see `Settings.chatDatabaseReaders`
+      // and the benchmark it points at.
+      let database = try ReadOnlyDatabase(
+        path: ChatDatabase.defaultPath,
+        maximumReaders: await settings.get(Settings.chatDatabaseReaders))
+      let profile = try await SchemaProfile.detect(
+        in: database, osMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+      )
+      logger.info(
+        "Opened chat.db",
+        metadata: [
+          "dateUnit": .string(String(describing: profile.dateUnit)),
+          // What it OPENED with, not what was asked for: a pool that could not open falls
+          // back to one connection, and a setting that silently did nothing is worse than
+          // one that did nothing loudly.
+          "readers": .stringConvertible(database.readerCount),
+        ])
+      return ReadPath(
+        database: database,
+        profile: profile,
+        // The index is handed to the repository HERE, and this line is the whole of the
+        // read half of message search. Without it the indexer fills a file nothing ever
+        // consults, which is exactly what happened: the parameter defaulted to nil, every
+        // unit test injected its own store, and the first run against a real database
+        // returned identical totals with the feature on and off.
+        messages: MessageRepository(
+          database: database, profile: profile, searchIndex: searchIndex),
+        serializer: MessageSerializer(profile: profile),
+        searchIndex: searchIndex
+      )
+    } catch {
+      // Reported, not fatal.
+      logger.warning(
+        "chat.db is not readable; the read path is unavailable",
+        metadata: [
+          "error": .string(String(describing: error))
+        ])
+      return ReadPath(searchIndex: searchIndex)
+    }
+  }
+
+  // MARK: - Cross-cutting
+
+  /// The four services everything else is built on top of.
+  struct SharedServices: Sendable {
+    let alerts: AlertCenter
+    let permissions: PermissionsService
+    let accessControl: AccessControlService
+    let contacts: ContactIndex
+    /// Built here, before the access controller and the transport, because both record
+    /// into it from their construction. Inert until `AuditLogService` arms it.
+    let auditLog: AuditRecorder
+    /// Built here rather than by `LicenseService`, because it holds the license key and the
+    /// key is a secret no service may declare a read of. Also because the HTTP service needs
+    /// the same instance and neither service may construct the other's state.
+    let license: LicenseRuntime
+  }
+
+  /// Builds the alert centre, the permission monitor, access control and the contact index.
+  static func makeSharedServices(storage: Storage) async -> SharedServices {
+    let appDatabase = storage.appDatabase
+    let settings = storage.settings
+
+    // The audit recorder, built before the first thing that records into it. The observers
+    // that feed it from objects built in this function are attached as those are built;
+    // the settings store's below. It is disarmed until the audit log service arms it.
+    let auditLog = AuditRecorder()
+
+    // The endpoint is composition-time, so it is read once here. The KEY is not read at
+    // all: `LicenseStore` holds the store and answers questions about the key without
+    // returning it. The runtime reports what it finds and does to the audit log, which is
+    // why the recorder is built first.
+    let license = LicenseRuntime(
+      store: LicenseStore(settings: settings),
+      client: EntitlementClient(
+        endpoint: await settings.get(Settings.licenseEndpoint),
+        serverVersion: ServerVersion.current
+      ),
+      machine: MachineFingerprint.of(seed: MachineIdentity.stableSeed),
+      auditor: AuditLicenseBridge(recorder: auditLog)
+    )
+
+    let alerts = AlertCenter()
+    // Attached before anything can raise, so an alert from start-up (the likeliest moment
+    // for one) is stored rather than being the one that gets lost. Restoring happens here
+    // too: what comes back is what was unread and undismissed within the retention window,
+    // with live-condition alerts restored already-read so a problem that cleared while the
+    // server was down does not greet the user as current.
+    await alerts.attach(store: AlertRepository(database: appDatabase))
+
+    // The settings store is told about the recorder here rather than in `prepareStorage`,
+    // which has no recorder yet; a write made before this line (the log level, say) is
+    // start-up bookkeeping the audit log would drop as disarmed anyway.
+    await settings.attachAuditObserver(AuditSettingsBridge(recorder: auditLog))
+
+    // The settings store is built before this point, so a Keychain failure during
+    // start-up (the likeliest moment for one, and the one that decides whether the
+    // server can authenticate at all) has nowhere to be reported until now. Attaching
+    // drains anything already held.
+    await settings.attachAlerts(alerts)
+
+    let permissions = PermissionsService(
+      onChange: { id, from, to in
+        // A permission revoked after setup (which happens on OS upgrades) is
+        // reported when it breaks rather than surfacing later as odd failures.
+        //
+        // **`.unknown` IS NOT A REVOCATION**, and treating it as one produced 112 "A
+        // permission was revoked" notifications for `automation-messages` on a permission
+        // the Permissions page correctly showed as granted the whole time. Its own
+        // declaration says what it means: "the check could not run. Reported rather than
+        // guessed at." The probe returns it whenever
+        // `AEDeterminePermissionToAutomateTarget` overruns `tccProbeDeadline`: measured,
+        // with a thread parked in it on a semaphore, so a busy `tccd` became a scary
+        // warning about a permission nobody had touched.
+        //
+        // Only a DEFINITE negative is worth waking somebody for. `.restricted` counts: MDM
+        // or parental controls really did take it away.
+        guard from == .granted, to.isDefiniteRefusal else { return }
+        await alerts.raise(
+          UserAlert(
+            severity: .warning,
+            title: "A permission was revoked",
+            body: "\(id.rawValue) is no longer granted, so some features have stopped working.",
+            source: "Permissions",
+            // Coalesced: a permission that flaps must not produce one alert per
+            // two-second refresh.
+            dedupeKey: "permission.\(id.rawValue)"
+          )
+        )
+      }
+    )
+
+    let accessControl = AccessControlService(
+      policy: await accessPolicy(from: settings),
+      trust: await proxyTrust(from: settings),
+      alerts: alerts,
+      persistence: AccessControlStore(database: appDatabase),
+      auditor: AuditAccessControlBridge(recorder: auditLog)
+    )
+    // Read back BEFORE anything is served, so a client blocked before the restart does
+    // not get one free window, and an administrator's allowlist is in force from the
+    // first request rather than from whenever they next open the Security page.
+    await accessControl.loadPersistedState()
+    await accessControl.trustLocalNetwork(await settings.get(Settings.trustLocalNetwork))
+
+    return SharedServices(
+      alerts: alerts,
+      permissions: permissions,
+      accessControl: accessControl,
+      contacts: ContactIndex(database: appDatabase),
+      auditLog: auditLog,
+      license: license
+    )
+  }
+
+  // MARK: - Transport
+
+  /// How a client reaches the server: what it may speak, how it proves who it is, and the
+  /// socket it speaks over.
+  struct Transport: Sendable {
+    let authMode: AuthMode
+    let codecs: CodecNegotiator
+    let tokenAuth: TokenAuthService
+    let passwordDigests: PasswordDigestCache
+    let events: EventBus
+    let socketServer: SocketServer
+    let engineIO: EngineIOServer
+  }
+
+  static func makeTransport(
+    storage: Storage,
+    accessControl: AccessControlService,
+    auditLog: AuditRecorder
+  ) async -> Transport {
+    let settings = storage.settings
+
+    // Codecs are registered, but the ceiling defaults to legacy-v1, so a client
+    // advertising sealed-v2 still gets legacy-v1 until an operator raises it. Built to be
+    // switchable, not switched.
+    let codecPreference = await settings.get(Settings.eventPayloadCodec)
+    let codecs = CodecNegotiator.full(preference: CodecIdentifier(codecPreference.rawValue))
+
+    // Under `auth_mode = password` this constructs nothing: no signing key, no device
+    // store, no bearer scheme.
+    let authMode = await settings.get(Settings.authMode)
+    let tokenAuth = TokenAuthService(
+      configuration: TokenAuthConfiguration(mode: authMode),
+      secrets: authMode == .password ? nil : storage.secrets
+    )
+
+    // Hashed once, not once per request. `SettingsPropagation` clears it when `password`
+    // is written, so the "checked against the password as it is now" property below still
+    // holds; see PasswordDigest.swift for why only successful reads are cached.
+    let passwordDigests = PasswordDigestCache(
+      load: { await settings.secret(Settings.password) }
+    )
+
+    let socketServer = SocketServer(negotiator: codecs)
+    let engineIO = EngineIOServer(
+      server: socketServer,
+      // The auth chain is a CLOSURE rather than a value, so a handshake is checked against
+      // the password as it is now. Capturing a chain here would keep authenticating
+      // against whatever the password was at launch, and a password change would not lock
+      // anybody out until the process restarted: the opposite of what changing it means.
+      chain: { [tokenAuth] in
+        await tokenAuth.chain(
+          passwordProvider: { await passwordDigests.digest() }
+        )
+      },
+      // THE SAME instance the HTTP middleware admits requests through, not a second one.
+      // One block list across both transports is the point: a client that exhausts its
+      // attempts over HTTP is blocked on the socket in the same moment, and the failures
+      // it accumulates on either count toward one lockout. Two services would mean two
+      // counters and twice the guesses. `SocketAccessControlWiringTests` asserts this
+      // argument is here, because its absence is silent: handshakes keep working and
+      // nothing is ever counted.
+      accessControl: accessControl,
+      // The same recorder the HTTP stage records into, so a wrong password over the socket
+      // leaves the same audit record a wrong password over HTTP does.
+      auditor: AuditAuthenticationBridge(recorder: auditLog),
+      // A closure for the same reason the chain is one, and additionally because the
+      // engine outlives every start and stop of the socket service. Reading the setting
+      // per handshake is also what makes the answer right at BOOT: a socket switched off
+      // before the server started never runs `SocketService.start`, so a flag that only
+      // that method could set would say "accepting" forever.
+      isAccepting: { [settings] in
+        await ServiceEnablement.isEnabled(BuiltInManifests.ID.socket, settings: settings)
+      }
+    )
+
+    return Transport(
+      authMode: authMode,
+      codecs: codecs,
+      tokenAuth: tokenAuth,
+      passwordDigests: passwordDigests,
+      events: EventBus(),
+      socketServer: socketServer,
+      engineIO: engineIO
+    )
+  }
+
+  // MARK: - Registry
+
+  static func makeRegistry(
+    context: AppContext, shared: SharedServices, settings: SettingsStore
+  ) async -> ServiceRegistry<AppContext> {
+    let alerts = shared.alerts
+    return ServiceRegistry(
+      host: context,
+      permissionCheck: await shared.permissions.permissionCheck(),
+      // What the Integrations screen's switches actually DO: a write to `disabled_services`
+      // reaches the registry here, so a webhook endpoint stops receiving events when it is
+      // switched off rather than only losing its "enabled" tag.
+      enablementCheck: { [settings] id in
+        await ServiceEnablement.isEnabled(id, settings: settings)
+      },
+      enablementSettings: [Settings.disabledServicesKey],
+      onAlert: { id, error in
+        await alerts.raise(
+          UserAlert(
+            severity: .error,
+            title: "\(id.rawValue) stopped working",
+            body: DiagnosticText.sentence(for: error),
+            source: "Services",
+            dedupeKey: "service.\(id.rawValue)",
+            // A live condition: on the next start the service either comes up or fails
+            // again and says so, so the stale one must not greet the user as current.
+            isDurable: false
+          )
+        )
+      }
+    )
+  }
+
+  /// Every service, registered. Order is DERIVED from each service's declared
+  /// dependencies, not from the order they appear here.
+  /// - Parameter refusing: services the manifest validator rejected. They are not
+  ///   registered at all, rather than registered and gated: a service the registry does not
+  ///   know about cannot be started by a settings change, a dependency, or a supervised
+  ///   retry. This is the half that was missing, which made the validator advisory.
+  static func registerServices(
+    in registry: ServiceRegistry<AppContext>,
+    refusing: Set<ServiceIdentifier> = []
+  ) async {
+    /// Registers unless the validator refused this service.
+    ///
+    /// Takes the projection the registry takes, rather than constraining `S.Host` to
+    /// `AppContext`: services declare narrow hosts on purpose, and the conversion is only
+    /// checkable where the concrete types are, which is the call site.
+    func register<S: Service>(
+      _ type: S.Type,
+      from project: @escaping @Sendable (AppContext) -> S.Host
+    ) async {
+      guard !refusing.contains(S.manifest.id) else { return }
+      await registry.register(type, from: project)
+    }
+    await register(PermissionsMonitorService.self) { $0 }
+    await register(ContactsService.self) { $0 }
+    await register(ChangeDetectionService.self) { $0 }
+    // Beside the watcher because they read the same database, and independent of it because
+    // they share nothing else: no cursor, no ordering, and deliberately no dependency, so a
+    // watcher restart cannot discard a backfill in progress.
+    await register(MessageSearchIndexService.self) { $0 }
+    await register(HTTPService.self) { HTTPServiceHost($0) }
+    await register(SocketService.self) { $0 }
+    await register(PrivateAPIGatedService.self) { $0 }
+    await register(PushDeliveryService.self) { $0 }
+    await register(WebhookDeliveryService.self) { $0 }
+    await register(NtfyDeliveryService.self) { $0 }
+    await register(ScheduledMessageService.self) { $0 }
+    // Six connection methods, one exclusive category: all register, and `canRun` lets
+    // exactly the selected one through. This is what makes a third-party tunnel possible:
+    // it joins a category rather than adding a case to an enum.
+    await register(ProxyService<LANMethod>.self) { $0 }
+    await register(ProxyService<DynamicDNSMethod>.self) { $0 }
+    await register(ProxyService<NgrokMethod>.self) { $0 }
+    await register(ProxyService<CloudflareMethod>.self) { $0 }
+    await register(ProxyService<ZrokMethod>.self) { $0 }
+    await register(ProxyService<TailscaleMethod>.self) { $0 }
+    await register(SleepPreventionService.self) { $0 }
+    await register(LaunchAtLoginService.self) { $0 }
+    await register(ToolUpdateService.self) { $0 }
+    await register(LicenseService.self) { $0 }
+    await register(NetworkPathService.self) { $0 }
+    await register(NetworkRecoveryService.self) { $0 }
+    await register(AuditLogService.self) { $0 }
+  }
+
+  // MARK: - Settings propagation
+
+  static func makePropagation(
+    settings: SettingsStore,
+    registry: ServiceRegistry<AppContext>,
+    context: AppContext,
+    shared: SharedServices,
+    passwordDigests: PasswordDigestCache
+  ) -> SettingsPropagation {
+    let alerts = shared.alerts
+    return SettingsPropagation(
+      settings: settings, registry: registry, accessControl: shared.accessControl,
+      // The tunnel writes `server_address` and this is what turns that write into
+      // something clients hear about: a `new-server` frame, and a Firebase document
+      // for the ones that are not connected.
+      onServerAddressChanged: { [weak context] address in
+        guard let lifecycle = await context?.lifecycle else { return }
+        await lifecycle.announce(serverAddress: address)
+      },
+      // Saved, not yet in effect, and one click from being in effect. Deduplicated
+      // on a fixed key so toggling one of these repeatedly leaves one standing
+      // notice rather than a pile of identical ones.
+      onRestartRequired: { [alerts] keys in
+        let names = keys.map(Settings.label(forKey:)).sorted()
+          .joined(separator: ", ")
+        await alerts.raise(
+          UserAlert(
+            severity: .info,
+            title: "Restart the server to apply this",
+            body: "\(names) is saved, but the server reads it while starting "
+              + "up. Restarting applies it; connected clients reconnect on "
+              + "their own.",
+            source: "settings",
+            actions: [.restartServer],
+            dedupeKey: "structural-setting-changed",
+            // Restarting is exactly what clears this, so it must never survive one.
+            isDurable: false
+          )
+        )
+      },
+      passwordDigests: passwordDigests
+    )
+  }
+
+  // MARK: - Routes
+
+  /// The additive route groups, chosen by configuration.
+  ///
+  /// This is where "not registered" is enforced. A group absent from this array is absent
+  /// from the router, and its paths 404 exactly like any unknown path.
+  static func routeGroups(
+    authMode: AuthMode,
+    codecs: CodecNegotiator,
+    features: Set<String> = [],
+    faceTime: Bool = false,
+    faceTimeIncoming: Bool = false
+  ) async -> [RouteGroup] {
+    var groups: [RouteGroup] = []
+
+    // ALWAYS MOUNTED. v2 is not opt-in.
+    //
+    // Gating it behind a setting would protect nobody. v1 is frozen and stays frozen, which
+    // is what actually protects an existing client; v2 is a separate prefix that no v1
+    // client asks for. A capability nobody can reach without first being told to flip a
+    // hidden setting may as well not exist, and every one of these is a feature a client
+    // wants: pinning, stickers, Send Later, polls, app balloons, wallpaper, the full alert
+    // and contact-card shapes.
+    //
+    // The two groups that genuinely should not ship are gated where the gate belongs, in
+    // `#if DEBUG` inside their own definitions rather than behind a runtime switch anyone
+    // holding an admin token could flip: `AdditiveRoutes.security` (which edits who may talk
+    // to this server) and the FaceTime debug diagnostics. Those stay compiled out.
+    groups.append(AdditiveRoutes.security)
+    // The richer alert shape. Additive because v1's is frozen at the reference's six
+    // keys; this is where the full alert shape becomes reachable.
+    groups.append(AdditiveRoutes.alerts)
+    // Mounted unconditionally, like the alerts group above. A client asking what this server
+    // is entitled to must get an answer whether or not a license exists: the unlicensed
+    // answer is the one that lets a client hide a paid feature instead of offering it and
+    // then refusing.
+    groups.append(AdditiveRoutes.subscription)
+    // A second way to get an avatar the contact payload already carries.
+    groups.append(AdditiveRoutes.contactAvatar)
+    // Pinning: a helper capability the Node server never had a route for.
+    groups.append(AdditiveRoutes.chatPinning)
+    // Stickers: likewise, a send the Node helper never had an action for.
+    groups.append(AdditiveRoutes.stickers)
+    // The sticker library. Reads need no helper: the store is a SQLite file.
+    groups.append(AdditiveRoutes.stickerLibrary)
+    // Send Later: Apple's scheduling, distinct from this server's own timer.
+    groups.append(AdditiveRoutes.sendLater)
+    // Polls, macOS 26.
+    groups.append(AdditiveRoutes.polls)
+    // Any iMessage app's balloon, Game Pigeon included.
+    groups.append(AdditiveRoutes.appMessages)
+    // Editing a webhook, which the Node server only ever exposed to its own UI.
+    groups.append(AdditiveRoutes.webhookEditing)
+    // Conversation controls: wallpaper today, mute and filtering next.
+    groups.append(AdditiveRoutes.chatControls)
+    // The shared contact card, with the handle and shared-state v1 cannot carry.
+    groups.append(AdditiveRoutes.contactCard)
+
+    // Feature flags, each independently off by default. Unlike v2 as a whole, these are
+    // about a capability not being ready to be reachable at all, rather than about which
+    // prefix it lives under.
+    if features.contains(Features.findMy.id) {
+      groups.append(AdditiveRoutes.findMy)
+
+      // Nested rather than parallel: the sharing routes sit under the same prefix and
+      // are meaningless without the status route to tell a client whether FindMy works
+      // at all. Both flags have to be on.
+      //
+      // Registers NOTHING in a release build: `findMySharing` is `#if DEBUG` and answers
+      // with an empty route list. Kept here so a development build still honours the flag.
+      if features.contains(Features.findMyLocationSharing.id) {
+        groups.append(AdditiveRoutes.findMySharing)
+      }
+    }
+
+    // FaceTime, same structure: the incoming-call flow is nested under the enhanced flag
+    // because it shares the prefix and is meaningless without the rest.
+    // Settings, not feature flags: FaceTime is a capability a user turns on, the same
+    // way they turn on the Messages Private API.
+    if faceTime {
+      groups.append(AdditiveRoutes.faceTime)
+      // Nested: the incoming flow shares the prefix and is meaningless without the rest.
+      if faceTimeIncoming {
+        groups.append(AdditiveRoutes.faceTimeIncoming)
+      }
+    }
+
+    if authMode != .password {
+      groups.append(AdditiveRoutes.auth)
+    }
+    // Hydration is only meaningful to a client on reference-v2 or sealed-v2. On a
+    // legacy-only server nobody can call it, so it does not exist.
+    if codecs.serverPreference != .legacyV1 {
+      groups.append(AdditiveRoutes.hydration)
+    }
+    return groups
+  }
+
+  static func buildHandlers(
+    context: AppContext,
+    authMode: AuthMode,
+    codecs: CodecNegotiator,
+    additionalGroups: [RouteGroup] = [],
+    logSink: FileSink? = nil,
+    logger: Logger? = nil
+  ) async -> HandlerRegistry {
+    var registry = HandlerRegistry()
+
+    CoreHandlers.register(into: &registry, context: context)
+    LandingHandlers.register(into: &registry, context: context)
+    FindMyHandlers.register(into: &registry, context: context)
+    FaceTimeHandlers.register(into: &registry, context: context)
+    ReadHandlers.register(into: &registry, context: context)
+    WriteHandlers.register(into: &registry, context: context)
+    AdminHandlers.register(into: &registry, context: context)
+    AdminHandlers.registerSubscription(into: &registry, context: context)
+    ContactHandlers.register(into: &registry, context: context)
+    ScheduleHandlers.register(into: &registry, context: context)
+    SystemHandlers.register(into: &registry, context: context, logSink: logSink)
+    MediaHandlers.register(into: &registry, context: context)
+    StickerHandlers.register(into: &registry, context: context)
+    PushHandlers.register(into: &registry, context: context)
+    UploadHandlers.register(into: &registry, context: context)
+    UpdateHandlers.register(into: &registry, context: context)
+    SecurityHandlers.register(into: &registry, context: context)
+    if authMode != .password {
+      AuthHandlers.register(into: &registry, context: context)
+    }
+    if codecs.serverPreference != .legacyV1 {
+      HydrationHandlers.register(into: &registry, context: context)
+    }
+
+    // Everything the interfaces layer has not reached yet is mounted and answers 501.
+    //
+    // The alternative (letting `buildRouter` refuse to start) would be defensible and
+    // useless: the server could not run until all 107 controllers existed. Mounting them
+    // with the truthful status keeps the gap measurable instead of hiding it behind a
+    // 404 that looks like a missing route.
+    let unimplemented = PlaceholderHandlers.fill(
+      into: &registry, groups: RouteTable.alwaysMounted + additionalGroups
+    )
+    if !unimplemented.isEmpty {
+      logger?.warning(
+        "Endpoints not yet implemented",
+        metadata: [
+          "handlers": .string(unimplemented.map(\.rawValue).sorted().joined(separator: ",")),
+          "count": .stringConvertible(unimplemented.count),
+          "of": .stringConvertible(
+            RouteTable.groups.flatMap(\.routes).count
+              + additionalGroups.flatMap(\.routes).count),
+        ])
+    }
+    return registry
+  }
+
+  // MARK: - Helpers
+
+  /// The whole policy, not just the on/off switch.
+  ///
+  /// `rate_limit_failures` and `rate_limit_block_seconds` were declared, rendered in the
+  /// Security section, and read by nothing, so moving either slider changed no behaviour.
+  static func accessPolicy(from settings: SettingsStore) async -> AccessControlPolicy {
+    var policy = AccessControlPolicy()
+    policy.isEnabled = await settings.get(Settings.rateLimitEnabled)
+    policy.perClientThreshold = max(1, await settings.get(Settings.rateLimitFailureThreshold))
+    policy.baseLockout = .seconds(max(1, await settings.get(Settings.rateLimitBlockSeconds)))
+    // Kept above the base so escalation has somewhere to go, whatever the operator set.
+    policy.maximumLockout = max(policy.baseLockout, .seconds(86_400))
+    return policy
+  }
+
+  /// Who is allowed to set `X-Forwarded-For`, from `trusted_proxies`.
+  ///
+  /// Loopback is always included and cannot be configured away: the managed ngrok,
+  /// cloudflared, zrok and tailscaled processes all connect over it, and dropping it would
+  /// make every
+  /// tunnelled client unattributable.
+  static func proxyTrust(from settings: SettingsStore) async -> ProxyTrustPolicy {
+    var trust = ProxyTrustPolicy()
+    let declared = await settings.get(Settings.trustedProxies)
+      .split(separator: ",")
+      .map { $0.trimmingCharacters(in: .whitespaces) }
+      .filter { !$0.isEmpty }
+    trust.trustedProxies.formUnion(declared)
+    return trust
+  }
+}
+
+/// An assembled server, not yet started.
+public struct RunningServer: Sendable {
+  public let context: AppContext
+  /// The file the server is logging to. Held so the app's log viewer can tail it without
+  /// re-deriving the path, and so a test can point both at the same temporary file.
+  public let logSink: FileSink?
+  public let registry: ServiceRegistry<AppContext>
+  /// Routes settings writes to the services that watch them. Held for its lifetime: it
+  /// owns a subscription task, and dropping it would silently stop config propagation.
+  public let propagation: SettingsPropagation
+  public let handlers: HandlerRegistry
+  public let routeGroups: [RouteGroup]
+  public let options: ServerComposition.Options
+  let logger: Logger
+
+  /// Starts everything, in dependency order.
+  public func start() async throws {
+    // Mount checked before anything starts, across the WHOLE table rather than just the
+    // additive groups: the core table is the part with ~90 routes in it.
+    //
+    // **This cannot fire in production, and the comment used to say it could.** It claimed a
+    // route with no handler was "a hard failure here rather than a 404 at runtime", which
+    // reads as the guard that makes an unhandled route impossible. It is not:
+    // `PlaceholderHandlers.fill` runs a few lines above over `RouteTable.alwaysMounted +
+    // additionalGroups`, which is a SUPERSET of what this iterates, so `missing` is always
+    // empty by the time it is computed and `unregisteredHandlers` can never be thrown.
+    //
+    // The 501 the placeholders answer with is the deliberate design — an unimplemented route
+    // says so rather than 404ing as though it did not exist — so the code is right and the
+    // description was wrong. What this check actually protects is a registry assembled BY
+    // HAND, which today means a test: `HTTPServer` carries the same guard and its own comment
+    // is honest about this.
+    let missing = handlers.missing(for: RouteTable.groups + routeGroups)
+    if !missing.isEmpty {
+      logger.error(
+        "Route handlers are missing",
+        metadata: [
+          "handlers": .string(missing.map(\.rawValue).joined(separator: ", "))
+        ])
+      throw HTTPMountError.unregisteredHandlers(missing)
+    }
+
+    // Subscribed BEFORE the services start. A service that writes a setting during its
+    // own startup (the proxy publishing its address is the live example) must not do
+    // it into a stream nobody is reading yet.
+    await propagation.start()
+
+    // Anything a previous process left running. Before the proxies start, so the port
+    // and the tunnel an orphan holds are free by the time the replacement asks.
+    DaemonLedger.shared.reapOrphans(logger: logger)
+
+    // Before the services, so the first requests and events are counted. The observer is a
+    // tap on the bus, not a sink; see `EventBus.dispatchObserver`.
+    let metrics = context.metrics
+    await context.events.setDispatchObserver { metrics.noteDispatched($0) }
+    await metrics.start(sources: context.metricSources())
+
+    try await AuditContext.acting(as: .system(component: "startup")) {
+      try await registry.startAll()
+    }
+    logger.info("Server started")
+  }
+
+  /// Stops everything, in exactly the reverse of the start order.
+  public func stop() async {
+    await propagation.stop()
+    // Before the sinks stop: a FindMy position held by the rate limiter is the newest one
+    // there is, and it can only reach a socket that is still open.
+    await context.events.flushPending()
+    // And before the process goes: a block or an unblock made seconds ago may still be
+    // queued for its table rewrite, and the whole point of persisting it is that it
+    // survives the restart. Same argument as the line above, about durable state rather
+    // than deliverable state.
+    await context.accessControl.flushPersistedState()
+    await AuditContext.acting(as: .system(component: "shutdown")) {
+      await registry.stopAll()
+    }
+    // After the services, so the last minute includes their shutdown, and so the server's
+    // availability span ends when the server actually did.
+    await context.metrics.stop()
+    await context.events.setDispatchObserver(nil)
+    logger.info("Server stopped")
+  }
+}
+
+// MARK: - Adapters
+
+/// Where chat.db lives.
+public enum ChatDatabase {
+  static var defaultPath: String {
+    NSHomeDirectory() + "/Library/Messages/chat.db"
+  }
+}
+
+/// Reads a YAML/env config file, if one is present.
+public enum ConfigFile {
+  /// Absent is normal: most installs configure through the UI. Returning empty rather
+  /// than failing means "no config file" is not an error.
+  static func load(at path: String?) -> [String: String] {
+    let resolved = path ?? NSHomeDirectory() + "/bluebubbles.yml"
+    guard let contents = try? String(contentsOfFile: resolved, encoding: .utf8) else {
+      return [:]
+    }
+
+    // Deliberately a `key: value` reader rather than a YAML parser. The file exists for
+    // headless and container deployments to set a handful of scalars; supporting nested
+    // YAML would mean a dependency and a schema for something nothing needs.
+    var values: [String: String] = [:]
+    for line in contents.split(separator: "\n") {
+      let trimmed = line.trimmingCharacters(in: .whitespaces)
+      guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
+      let parts = trimmed.split(separator: ":", maxSplits: 1)
+      guard parts.count == 2 else { continue }
+      values[String(parts[0]).trimmingCharacters(in: .whitespaces)] =
+        String(parts[1])
+        .trimmingCharacters(in: .whitespaces)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+    }
+    return values
+  }
+}
+
+/// Bridges BBSettings' secret store to the narrow protocol BBAuth declares.
+///
