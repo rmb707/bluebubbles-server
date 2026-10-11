@@ -1,12 +1,12 @@
 import { Server } from "@server";
 import path from "path";
-import fs from "fs";
 import { FileSystem } from "@server/fileSystem";
-import { isMinBigSur, isMinSequoia, isMinSonoma } from "@server/env";
+import { isMinBigSur, isMinSonoma } from "@server/env";
 import { checkPrivateApiStatus, waitMs } from "@server/helpers/utils";
 import { quitFindMyFriends, startFindMyFriends, showFindMyFriends, hideFindMyFriends } from "../apple/scripts";
 import { FindMyDevice, FindMyItem, FindMyLocationItem } from "@server/api/lib/findmy/types";
 import { transformFindMyItemToDevice } from "@server/api/lib/findmy/utils";
+import { readFindMyCacheFile } from "@server/api/lib/findmy/cacheCrypto";
 
 export class FindMyInterface {
     static async getFriends() {
@@ -14,11 +14,6 @@ export class FindMyInterface {
     }
 
     static async getDevices(): Promise<Array<FindMyDevice> | null> {
-        if (isMinSequoia) {
-            Server().logger.debug('Cannot fetch FindMy devices on macOS Sequoia or later.');
-            return null;
-        }
-
         try {
             const [devices, items] = await Promise.all([
                 FindMyInterface.readDataFile("Devices"),
@@ -112,47 +107,33 @@ export class FindMyInterface {
 
     static async readItemGroups(): Promise<Array<any>> {
         const itemGroupsPath = path.join(FileSystem.findMyDir, "ItemGroups.data");
-        if (!fs.existsSync(itemGroupsPath)) return [];
+        const parsedData = readFindMyCacheFile(itemGroupsPath, "FMIPDataManager");
+        if (parsedData == null) return [];
+        if (!Array.isArray(parsedData)) {
+            throw new Error("Failed to read FindMy ItemGroups cache file! It is not an array!");
+        }
 
-        return new Promise((resolve, reject) => {
-            fs.readFile(itemGroupsPath, { encoding: "utf-8" }, (err, data) => {
-                // Couldn't read the file
-                if (err) return resolve(null);
-
-                try {
-                    const parsedData = JSON.parse(data.toString());
-                    if (Array.isArray(parsedData)) {
-                        return resolve(parsedData);
-                    } else {
-                        reject(new Error("Failed to read FindMy ItemGroups cache file! It is not an array!"));
-                    }
-                } catch {
-                    reject(new Error("Failed to read FindMy ItemGroups cache file! It is not in the correct format!"));
-                }
-            });
-        });
+        return parsedData;
     }
 
-    private static readDataFile<T extends "Devices" | "Items">(
+    private static async readDataFile<T extends "Devices" | "Items">(
         type: T
     ): Promise<Array<T extends "Devices" ? FindMyDevice : FindMyItem> | null> {
         const devicesPath = path.join(FileSystem.findMyDir, `${type}.data`);
-        return new Promise((resolve, reject) => {
-            fs.readFile(devicesPath, { encoding: "utf-8" }, (err, data) => {
-                // Couldn't read the file
-                if (err) return resolve(null);
 
-                try {
-                    const parsedData = JSON.parse(data.toString());
-                    if (Array.isArray(parsedData)) {
-                        return resolve(parsedData);
-                    } else {
-                        reject(new Error(`Failed to read FindMy ${type} cache file! It is not an array!`));
-                    }
-                } catch {
-                    reject(new Error(`Failed to read FindMy ${type} cache file! It is not in the correct format!`));
-                }
-            });
-        });
+        let parsedData: any;
+        try {
+            parsedData = readFindMyCacheFile(devicesPath, "FMIPDataManager");
+        } catch (ex: any) {
+            Server().logger.debug(`Failed to decrypt FindMy ${type} cache file: ${ex?.message ?? ex}`);
+            return null;
+        }
+
+        if (parsedData == null) return null;
+        if (!Array.isArray(parsedData)) {
+            throw new Error(`Failed to read FindMy ${type} cache file! It is not an array!`);
+        }
+
+        return parsedData;
     }
 }
